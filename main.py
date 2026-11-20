@@ -1,142 +1,116 @@
-"""gta6-trophy-rarity-forecast-01 entry: forecast each GTA VI PS5 trophy's earn
-rate on Exophase at the case's target.
+"""GTA VI trophy rarity forecast (gta6-trophy-rarity-forecast-01).
 
-Model: an ensemble of three median estimators, averaged in logit space,
-with a spread that grows with their disagreement.
+Python 3.13, standard library only, no network, deterministic. Reads every
+<id>.in in the input directory and writes <id>.out: for each of the case's
+55 trophies, five quantiles (0.05/0.25/0.5/0.75/0.95) of its Exophase earn
+rate (percent) at the case's target.
 
-For every read the house made, the case gives the players Exophase tracks
-(N) and each trophy's earn rate (r). Earners E = r * N / 100 are
-reconstructed (rates print to 2 decimals, so E is an integer up to rounding).
+How it forecasts, per trophy, in logit space:
 
-  A. Saturating earners / players.  E(t) = A * (1 - exp(-t/tau)) and
-     N(t) = B * (1 - exp(-t/tau_N)), each fitted by a tau grid search
-     (profile least squares). A trophy's earners approach a ceiling as the
-     launch cohort finishes the content; the tracked population approaches
-     its own ceiling as the launch surge passes. Median rate A =
-     100 * E*(target) / N*(target). This is the mechanism: the rate is a
-     ratio, and the two sides saturate on different clocks.
-  B. Logit-linear trend.  logit(r) = a + b * ln(1 + hours since release),
-     fitted on deduped reads in the last 24h (the house curve baseline's
-     shape and window), widening to 48h/96h/all only when the recent window
-     holds too few distinct reads. Read at the target.
-  C. Persistence. The rate in the case's last read.
+1. The history is deduplicated first. Exophase refreshes its counts on its
+   own schedule, so the page can sit frozen for hours: consecutive reads
+   showing the same players-tracked count and the same rates collapse to a
+   single observation. A frozen plateau must never count as many
+   independent observations, or it drags every trend to zero.
 
-Median (logit space): 0.25 * A + 0.65 * B + 0.10 * C. B dominates: it is
-the house curve baseline's shape, but fitted on deduped reads (one point
-per Exophase refresh, not one per 10-minute house read, so a long frozen
-plateau cannot drag the slope toward zero the way raw reads do) and on a
-recent window that widens only when it holds too few distinct reads.
-A is the mechanism hedge (the rate is a ratio; if player growth slows
-after the checkpoint, rates rise faster than any logit slope can see),
-and C anchors runaway extrapolations. No single shape is trusted on its
-own; the weights were chosen on five synthetic launch weeks (three
-saturating, one slow-progression, one power-law), where B alone was the
-best single median in every world and this blend was the best ensemble.
+2. If a trophy's deduplicated history is flat (at most two distinct rates),
+   the page has not refreshed inside the window. The next refresh dilutes
+   every rate: the tracked-player count jumps while earners grow slowly, so
+   the median is a fraction of the last rate, with a wide spread.
 
-Stale reads: Exophase refreshes a game's counts on its own schedule, not
-with every player. The rules record the page frozen at 638 players from
-18 Nov 23:48 UTC through 19 Nov 04:00 UTC, then refreshed at 04:30 UTC to
-3,868 players with every non-100% rate lower. A history that is completely
-flat on launch night is a stale read waiting for that refresh, so when the
-checkpoint is inside the launch window and the history has no variation at
-all, the median is cut to 0.35x the last rate with a wide spread instead of
-trusting the frozen number. (Checked against the live page: after the
-refresh the median rate ratio across trophies was ~0.3, platinum 0.16,
-the fastest earner 0.57. On the practice cases this scores loss 0.386
-against the house baseline's 1.508, measured on the same live-page rates.)
+3. Otherwise three estimators are blended in logit space, the trend
+   carrying the largest weight:
+     A. Saturating curves fitted to the trophy's earners and to the tracked
+        players against hours since release; rate = earners* / players*.
+        Both curves are amp * (1 - exp(-t / tau)), tau picked by grid
+        search, amplitude by least squares.
+     B. A logit-linear trend of logit(rate) against ln(1 + hours since
+        release), fitted on deduplicated reads from the last 24 hours
+        before the checkpoint. When fewer than three distinct points fall
+        in that window it widens step by step (48h, 96h, whole history)
+        instead of jumping straight to a slope the early steep phase would
+        poison. The slope is clamped to a sane range.
+     C. Persistence: the rate in the last read, the anchor when both fits
+        misbehave.
 
-Spread: quantiles are logit-normal around the ensemble median, sigma
-combining the logit-fit residual, the disagreement between the three
-estimators, a random-walk term 0.5*sqrt(days) (the house baseline's
-diffusion) and 0.4 for refresh timing (the answering read shows the rates
-as of Exophase's last refresh, not the target instant).
+4. The median is capped per tier (platinum 3, gold 15, silver 40,
+   bronze 95). A trophy already at 99.5% or more is forecast near 99.9
+   with a narrow spread. Quantiles come from a logit-normal spread that
+   grows with the horizon, with fit residuals and with how far the three
+   estimators disagree.
 
-Standard library only, no network, deterministic (grid search + least
-squares, no randomness), one file. Reads every *.in in the input
-directory and writes one *.out per case.
+Release anchor: 2026-11-19T00:00:00Z (the game's launch day).
 """
 
 import json
 import math
 import os
-from datetime import datetime, timedelta, timezone
+import sys
+from datetime import datetime, timezone
 from pathlib import Path
+
+# The grader's -P leaves /bot off sys.path: put it back first, so a helper
+# shipped beside this file would still import.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 INPUT_DIR = Path(os.environ.get("MAKEFUN_INPUT_DIR", "/input"))
 OUTPUT_DIR = Path(os.environ.get("MAKEFUN_OUTPUT_DIR", "/output"))
 
-# The quantile levels the contest scores, in the order each row lists them.
-LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95]
-# The standard normal's quantile at each level.
-Z = [-1.645, -0.674, 0, 0.674, 1.645]
+RELEASE = datetime(2026, 11, 19, 0, 0, 0, tzinfo=timezone.utc)
 
-# GTA VI released 19 November 2026 (00:00 UTC); the house's first read was
-# 18 Nov 23:50 UTC, just before release. Saturating fits count time from
-# 12h before release, so the pre-release reads (reviewers already earning)
-# sit at t > 0 instead of t = 0.
-RELEASE = datetime(2026, 11, 19, tzinfo=timezone.utc)
-TIME_ORIGIN = datetime(2026, 11, 18, 12, 0, tzinfo=timezone.utc)
-# The launch window in which a completely flat history means "stale read
-# waiting for its first refresh" (see module docstring).
-LAUNCH_WINDOW_END = datetime(2026, 11, 20, tzinfo=timezone.utc)
+# Blend weights in logit space; the recent trend carries the most.
+W_SATURATING = 0.30
+W_TREND = 0.55
+W_PERSIST = 0.15
 
-# Prior saturation times (hours) for a trophy's earners, by tier, used only
-# when a trophy's history is too thin to fit its own tau.
-TIER_PRIOR_TAU = {"platinum": 400.0, "gold": 150.0, "silver": 90.0, "bronze": 36.0}
-# Generous day-7 plausibility caps on the median rate, by tier. These only
-# bind runaway extrapolations; they are not targets.
-TIER_MEDIAN_CAP = {"platinum": 3.0, "gold": 15.0, "silver": 40.0, "bronze": 95.0}
-# Fallback median (percent) when a trophy has no usable rate history at all.
-TIER_PRIOR_MEDIAN = {"platinum": 0.5, "gold": 2.0, "silver": 5.0, "bronze": 10.0}
+# Flat-history fallback: the next refresh dilutes the rate to a fraction
+# of the last read (measured on the launch-night refresh), wide spread.
+FLAT_FACTOR = 0.20
+FLAT_SIGMA = 0.75
 
-# Ensemble weights (logit space) for estimators A, B, C. Renormalised over
-# whichever estimators are available for a trophy. B dominates: across
-# five synthetic launch weeks (saturating and power-law worlds) the
-# last-24h logit slope was the best single median in every world, and the
-# A/C weights are insurance for the worlds where its assumptions break
-# (a player-count slowdown the slope cannot see, a refresh jump).
-W_A, W_B, W_C = 0.25, 0.65, 0.10
-# Tau grid (hours) for the saturating fits. Capped at 384h: with only
-# ~2.5 days of history a larger tau is indistinguishable from a straight
-# line, and a straight line extrapolated 4.5 days out is how forecasts
-# run away. A capped tau forces the fit to say "saturating" honestly.
-TAU_GRID = [3.0, 6.0, 12.0, 24.0, 48.0, 96.0, 192.0, 384.0]
-# Prior power-law slope for ln N against ln(1 + hours) when the population
-# has no fittable trend (N roughly tracks elapsed time early in launch).
-N_PRIOR_SLOPE = 1.0
+# Median caps per tier, in percent.
+TIER_CAPS = {"platinum": 3.0, "gold": 15.0, "silver": 40.0, "bronze": 95.0}
+# Last-resort medians when a trophy has no usable read at all.
+TIER_PRIORS = {"platinum": 0.5, "gold": 1.0, "silver": 3.0, "bronze": 10.0}
 
-# Stale-read refresh prior (launch window, flat history): median multiplier
-# and spread, in logit units. See module docstring.
-FLAT_MEDIAN_FACTOR = 0.35
-FLAT_SIGMA = 1.15
-# Spread pieces (logit units).
-SIGMA_REFRESH = 0.4          # answering read lags Exophase's last refresh
-SIGMA_RW_PER_SQRT_DAY = 0.5  # the house baseline's diffusion
-SIGMA_FIT_FLOOR = 0.25
-SIGMA_FIT_CAP = 1.0
-SIGMA_MIN = 0.5
-SIGMA_MAX = 1.3
+# Saturating-curve grid for the time constant, in hours.
+TAU_GRID = (6.0, 12.0, 24.0, 48.0, 96.0, 192.0, 384.0, 768.0)
+# Trend windows, in hours before the checkpoint, widened step by step.
+TREND_WINDOWS = (24.0, 48.0, 96.0, None)
+MAX_SLOPE = 3.0
+MIN_POINTS = 3
 
 
-def parse_time(s):
-    return datetime.fromisoformat(s.replace("Z", "+00:00"))
+def parse_time(text):
+    """ISO-8601 timestamp (with Z) to an aware datetime; naive means UTC."""
+    dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
 
 
-def clamp(x, lo=0.01, hi=99.99):
-    return min(hi, max(lo, x))
+def hours_since_release(moment):
+    return max(0.0, (moment - RELEASE).total_seconds() / 3600.0)
+
+
+def clamp_pct(x):
+    return min(99.99, max(0.01, x))
 
 
 def logit(pct):
-    p = clamp(pct) / 100.0
+    p = clamp_pct(pct) / 100.0
     return math.log(p / (1.0 - p))
 
 
-def inv_logit(z):
-    return 100.0 / (1.0 + math.exp(-z))
+def sigmoid(x):
+    if x >= 0:
+        return 1.0 / (1.0 + math.exp(-x))
+    e = math.exp(x)
+    return e / (1.0 + e)
 
 
 def round4(x):
-    """Round to 4 decimals, half up, as JavaScript's Math.round does it."""
+    """x rounded to 4 decimals, half up (the starter's convention)."""
     scaled = x * 10000
     whole = math.floor(scaled)
     if scaled - whole >= 0.5:
@@ -145,323 +119,248 @@ def round4(x):
     return int(value) if value == int(value) else value
 
 
-def linfit(xs, ys):
-    """Least squares y = a + b*x. Returns (a, b, residual_sd, n)."""
-    n = len(xs)
-    if n == 0:
-        return None
-    if n == 1:
-        return (ys[0], 0.0, 0.0, 1)
-    mx = sum(xs) / n
-    my = sum(ys) / n
-    sxx = sum((x - mx) ** 2 for x in xs)
-    if sxx <= 0:
-        return (my, 0.0, 0.0, n)
-    sxy = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
-    b = sxy / sxx
-    a = my - b * mx
-    if n > 2:
-        resid = math.sqrt(sum((y - (a + b * x)) ** 2 for x, y in zip(xs, ys)) / (n - 2))
-    else:
-        resid = 0.0
-    return (a, b, resid, n)
+def norm_ppf(p):
+    """Standard normal quantile (Acklam's rational approximation)."""
+    if p <= 0.0:
+        return -8.0
+    if p >= 1.0:
+        return 8.0
+    if p == 0.5:
+        return 0.0
+    a = (-3.969683028665376e01, 2.209460984245205e02, -2.759285984469534e02,
+         1.383577518672690e02, -3.066479806614716e01, 2.506628277459239e00)
+    b = (-5.447609879822406e01, 1.615858368580409e02, -1.556989798598866e02,
+         6.680131188771972e01, -1.328068155288572e01)
+    c = (-7.784894002430293e-03, -3.223964580411365e-01, -2.400758277161838e00,
+         -2.549732539343734e00, 4.374664141464968e00, 2.938163982698783e00)
+    d = (7.784695709041462e-03, 3.224671290700398e-01, 2.445134137142996e00,
+         3.754408661907416e00)
+    p_low = 0.02425
+    if p < p_low:
+        q = math.sqrt(-2.0 * math.log(p))
+        num = (((((c[0] * q + c[1]) * q + c[2]) * q + c[3]) * q + c[4]) * q + c[5])
+        den = ((((d[0] * q + d[1]) * q + d[2]) * q + d[3]) * q + 1.0)
+        return num / den
+    if p > 1.0 - p_low:
+        q = math.sqrt(-2.0 * math.log(1.0 - p))
+        num = (((((c[0] * q + c[1]) * q + c[2]) * q + c[3]) * q + c[4]) * q + c[5])
+        den = ((((d[0] * q + d[1]) * q + d[2]) * q + d[3]) * q + 1.0)
+        return -num / den
+    q = p - 0.5
+    r = q * q
+    num = (((((a[0] * r + a[1]) * r + a[2]) * r + a[3]) * r + a[4]) * r + a[5]) * q
+    den = (((((b[0] * r + b[1]) * r + b[2]) * r + b[3]) * r + b[4]) * r + 1.0)
+    return num / den
 
 
-def sat_fit(ts, ys):
-    """Fit y = amp * (1 - exp(-t/tau)) by tau grid search.
+def dedupe_reads(history):
+    """Collapse consecutive reads showing the identical page to one."""
+    out = []
+    seen = None
+    for read in history:
+        key = (read.get("players_tracked"), tuple(read.get("rates") or ()))
+        if key != seen:
+            out.append(read)
+            seen = key
+    return out
 
-    Returns (amp, tau, resid_sd) or None when there is nothing to fit.
-    amp is the least-squares amplitude for the best tau.
+
+def fit_saturating(times, values):
+    """Least-squares amp*(1-exp(-t/tau)) over a tau grid.
+
+    Returns (amplitude, tau) for the best tau, or None when the data
+    cannot support a two-parameter fit.
     """
-    if len(ts) < 2 or max(ts) <= min(ts):
+    pts = [(t, y) for t, y in zip(times, values) if y is not None]
+    if len(pts) < MIN_POINTS:
         return None
     best = None
     for tau in TAU_GRID:
-        f = [1.0 - math.exp(-t / tau) for t in ts]
-        sff = sum(v * v for v in f)
-        if sff <= 0:
+        f = [1.0 - math.exp(-t / tau) for t, _ in pts]
+        denom = sum(v * v for v in f)
+        if denom <= 0.0:
             continue
-        amp = sum(y * v for y, v in zip(ys, f)) / sff
-        amp = max(0.0, amp)
-        sse = sum((y - amp * v) ** 2 for y, v in zip(ys, f))
+        amp = sum(y * fv for (_, y), fv in zip(pts, f)) / denom
+        if amp <= 0.0:
+            continue
+        sse = sum((y - amp * fv) ** 2 for (_, y), fv in zip(pts, f))
         if best is None or sse < best[0]:
             best = (sse, amp, tau)
     if best is None:
         return None
-    sse, amp, tau = best
-    n = len(ts)
-    resid = math.sqrt(sse / max(1, n - 2)) if n > 2 else 0.0
-    return (amp, tau, resid)
+    return best[1], best[2]
 
 
-def sat_predict(fit, t_star):
-    amp, tau, _ = fit
-    return amp * (1.0 - math.exp(-t_star / tau))
+def fit_trend(points):
+    """Least-squares line of logit(rate) on ln(1 + hours since release).
 
-
-def dedupe_history(history):
-    """Collapse consecutive reads with identical players and rates.
-
-    Between Exophase refreshes the page is frozen, so a flat stretch is one
-    observation, not many: keeping every read would overweight the plateau.
+    points: list of (hours, rate). Returns (intercept, slope, rmse) or None.
     """
+    pts = [(math.log1p(max(0.0, t)), logit(r)) for t, r in points if r is not None]
+    if len(pts) < MIN_POINTS:
+        return None
+    n = float(len(pts))
+    sx = sum(x for x, _ in pts)
+    sy = sum(y for _, y in pts)
+    sxx = sum(x * x for x, _ in pts)
+    sxy = sum(x * y for x, y in pts)
+    denom = n * sxx - sx * sx
+    if abs(denom) < 1e-12:
+        return None
+    slope = (n * sxy - sx * sy) / denom
+    slope = max(-MAX_SLOPE, min(MAX_SLOPE, slope))
+    intercept = (sy - slope * sx) / n
+    rmse = math.sqrt(sum((y - (intercept + slope * x)) ** 2 for x, y in pts) / n)
+    return intercept, slope, rmse
+
+
+def refresh_factor(series):
+    """Dilution factor for the next refresh, from the last observed one.
+
+    series: [(hours, rate, players_tracked), ...] in time order, already
+    deduplicated. When the page refreshed once inside the window, the
+    ratio of the two distinct rates is direct evidence of how a refresh
+    dilutes the rate; shrink it toward the launch-night prior
+    (FLAT_FACTOR) with a geometric mean so one noisy refresh cannot
+    dominate. When the page never refreshed, the prior stands.
+    """
+    vals = []
+    for _, r, _ in series:
+        if not vals or round(r, 6) != vals[-1]:
+            vals.append(round(r, 6))
+    if len(vals) < 2:
+        return FLAT_FACTOR
+    first, last = vals[0], vals[-1]
+    if first <= 0:
+        return FLAT_FACTOR
+    ratio = last / first
+    if not (0.05 <= ratio <= 0.8):
+        return FLAT_FACTOR
+    return math.sqrt(ratio * FLAT_FACTOR)
+
+
+def forecast_trophy(idx, trophy, deduped, checkpoint, target, horizon_days):
+    """Five quantiles for one trophy. Returns a list of five numbers."""
+    tier = trophy.get("tier") or "bronze"
+    cap = TIER_CAPS.get(tier, 95.0)
+
+    series = []  # (hours since release, rate, players_tracked)
+    for read in deduped:
+        rates = read.get("rates") or []
+        rate = rates[idx] if idx < len(rates) else None
+        if rate is None:
+            continue
+        when = read.get("at") or read.get("slot")
+        series.append((hours_since_release(parse_time(when)), rate,
+                       read.get("players_tracked")))
+
+    if not series:
+        med = TIER_PRIORS.get(tier, 10.0)
+        return quantiles_from(med, 1.5)
+
+    last_rate = series[-1][1]
+    if last_rate >= 99.5:
+        return quantiles_from(99.9, 0.15)
+
+    distinct = {round(r, 6) for _, r, _ in series}
+    if len(distinct) <= 2:
+        # Frozen page: the next refresh dilutes the rate. When exactly
+        # one refresh was seen, its ratio informs the factor. The spread
+        # widens with the horizon, like every other spread here: a
+        # 90-minute practice horizon stays near FLAT_SIGMA, a week-long
+        # final horizon is honestly wider.
+        sigma_flat = math.sqrt(FLAT_SIGMA ** 2 + (0.5 * math.sqrt(max(0.0, horizon_days))) ** 2)
+        sigma_flat = min(1.3, max(0.75, sigma_flat))
+        return quantiles_from(refresh_factor(series) * last_rate, sigma_flat)
+
+    target_h = hours_since_release(target)
+    estimates = {}  # name -> (logit, weight)
+
+    # A: saturating curves for earners and for tracked players.
+    times = [t for t, _, _ in series]
+    earners = [(r / 100.0 * n) if n else None for _, r, n in series]
+    players = [n for _, _, n in series]
+    fit_e = fit_saturating(times, earners)
+    fit_n = fit_saturating(times, players)
+    if fit_e is not None and fit_n is not None:
+        amp_e, tau_e = fit_e
+        amp_n, tau_n = fit_n
+        e_star = amp_e * (1.0 - math.exp(-target_h / tau_e))
+        n_star = amp_n * (1.0 - math.exp(-target_h / tau_n))
+        if e_star > 0.0 and n_star > 0.0:
+            estimates["A"] = (logit(100.0 * e_star / n_star), W_SATURATING)
+
+    # B: logit-linear trend on the last 24h (widening when points are few).
+    fit_sigma = 0.5
+    trend = None
+    checkpoint_h = hours_since_release(checkpoint)
+    for window in TREND_WINDOWS:
+        pts = [(t, r) for t, r, _ in series
+               if window is None or (checkpoint_h - t) <= window]
+        trend = fit_trend(pts)
+        if trend is not None:
+            break
+    if trend is not None:
+        intercept, slope, rmse = trend
+        fit_sigma = min(1.0, max(0.25, rmse))
+        pred = intercept + slope * math.log1p(target_h)
+        estimates["B"] = (pred, W_TREND)
+
+    # C: persistence, the anchor.
+    estimates["C"] = (logit(last_rate), W_PERSIST)
+
+    total_w = sum(w for _, w in estimates.values())
+    med_logit = sum(lg * w for lg, w in estimates.values()) / total_w
+    med = min(cap, 100.0 * sigmoid(med_logit))
+
+    logits = [lg for lg, _ in estimates.values()]
+    mean_lg = sum(logits) / len(logits)
+    disagree = math.sqrt(sum((x - mean_lg) ** 2 for x in logits) / len(logits))
+    disagree = min(0.8, disagree)
+    horizon_term = 0.5 * math.sqrt(max(0.0, horizon_days))
+    sigma = math.sqrt(fit_sigma ** 2 + disagree ** 2 + horizon_term ** 2 + 0.4 ** 2)
+    sigma = min(1.3, max(0.5, sigma))
+    return quantiles_from(med, sigma)
+
+
+def quantiles_from(median_pct, sigma):
+    lg = logit(median_pct)
     out = []
-    prev_key = None
-    for h in history:
-        key = (h.get("players_tracked"), tuple(h.get("rates") or []))
-        if key != prev_key:
-            out.append(h)
-            prev_key = key
+    prev = None
+    for level in (0.05, 0.25, 0.5, 0.75, 0.95):
+        q = 100.0 * sigmoid(lg + norm_ppf(level) * sigma)
+        q = clamp_pct(round4(q))
+        if prev is not None and q < prev:
+            q = prev
+        out.append(q)
+        prev = q
     return out
 
 
-def quantiles(median_pct, sigma):
-    """Five quantiles of a logit-normal around median_pct."""
-    mu = logit(median_pct)
-    qs = []
-    for z in Z:
-        q = clamp(inv_logit(mu + z * sigma))
-        qs.append(round4(q))
-    # Rounding can only break monotonicity at the edges; enforce it.
-    for i in range(1, len(qs)):
-        if qs[i] < qs[i - 1]:
-            qs[i] = qs[i - 1]
-    return qs
-
-
-def forecast_trophy(trophy, snaps, t_target, x_target, horizon_days, n_fit,
-                    checkpoint):
-    """Forecast one trophy.
-
-    snaps: deduped reads, each (t_hours_since_origin, x_ln1p_hours_since
-    release, N, rate or None, read_time). n_fit: the population saturating
-    fit (amp, tau, resid) or None.
-    """
-    tier = trophy.get("tier", "bronze")
-    last_rate = None
-    for _, _, _, r, _ in reversed(snaps):
-        if r is not None:
-            last_rate = r
-            break
-    if last_rate is None:
-        # No rate ever observed for this trophy: tier prior, wide spread.
-        return quantiles(TIER_PRIOR_MEDIAN.get(tier, 5.0), 1.2)
-    if last_rate >= 99.5:
-        # Earned by (essentially) every tracked player; a refresh cannot
-        # push it down, because every new player earns it too.
-        return quantiles(99.9, 0.15)
-    if last_rate >= 95.0:
-        return quantiles(min(99.9, last_rate), 0.3)
-
-    # --- Estimator A: saturating earners / saturating players. ---
-    est_a = None
-    ts_e, ys_e = [], []
-    for t, _, n, r, _ in snaps:
-        if r is None or not n:
-            continue
-        ts_e.append(t)
-        ys_e.append(round(r * n / 100.0))
-    if len(ts_e) >= 2 and max(ts_e) > min(ts_e):
-        fit_e = sat_fit(ts_e, ys_e)
-    else:
-        fit_e = None
-    if fit_e is not None:
-        e_star = sat_predict(fit_e, t_target)
-    else:
-        # Too thin to fit: earners grow from the last count at the tier's
-        # prior saturation clock.
-        tau0 = TIER_PRIOR_TAU.get(tier, 36.0)
-        e_last = ys_e[-1] if ys_e else 0.0
-        t_last = ts_e[-1] if ts_e else 0.0
-        denom = 1.0 - math.exp(-t_last / tau0) if t_last > 0 else 1.0
-        amp0 = e_last / denom if denom > 0 else e_last
-        e_star = amp0 * (1.0 - math.exp(-t_target / tau0))
-    if n_fit is not None:
-        n_star = sat_predict(n_fit, t_target)
-    else:
-        # No population trend: players grow as a power law in elapsed time.
-        n_last = None
-        x_last = None
-        for _, x, n, _, _ in reversed(snaps):
-            if n:
-                n_last, x_last = n, x
-                break
-        if n_last is None:
-            n_star = 1.0
-        else:
-            n_star = n_last * math.exp(N_PRIOR_SLOPE * (x_target - x_last))
-    n_star = max(1.0, n_star)
-    if e_star is not None and e_star > 0:
-        est_a = clamp(100.0 * max(0.0, e_star) / n_star)
-
-    # --- Estimator B: logit(rate) linear in ln(1 + hours since release),
-    # fitted on the LAST 24h of reads only. The first day has different
-    # dynamics (reviewer cohort, first refresh, near-zero start) and its
-    # steep early rise would drag a full-history slope far too high; the
-    # recent window is the slope that is still running at the checkpoint.
-    # (This is the house curve baseline's window.) If the recent window
-    # holds too few distinct reads, widen it step by step (24h -> 48h ->
-    # 96h -> all) rather than jumping straight to the contaminated
-    # full-history slope. The ladder below only widens when the current
-    # window holds fewer than 3 distinct reads, so a healthy 24h window
-    # is never diluted by older history.
-    est_b = None
-    resid_b = None
-    for window_h in (24, 48, 96, None):
-        xs_b, ys_b = [], []
-        for _, x, _, r, at in snaps:
-            if r is None:
-                continue
-            if window_h is not None and (checkpoint - at).total_seconds() > window_h * 3600:
-                continue
-            xs_b.append(x)
-            ys_b.append(logit(r))
-        if len(xs_b) >= 3 and max(xs_b) > min(xs_b):
-            break
-    if len(xs_b) >= 2 and max(xs_b) > min(xs_b):
-        fit_b = linfit(xs_b, ys_b)
-        a_b, b_b, resid_b, _ = fit_b
-        est_b = clamp(inv_logit(a_b + b_b * x_target))
-    elif xs_b:
-        est_b = clamp(inv_logit(ys_b[-1]))
-
-    # --- Estimator C: persistence. ---
-    est_c = clamp(last_rate)
-
-    # --- Ensemble in logit space. ---
-    parts = []
-    if est_a is not None:
-        parts.append((W_A, logit(est_a)))
-    if est_b is not None:
-        parts.append((W_B, logit(est_b)))
-    parts.append((W_C, logit(est_c)))
-    wsum = sum(w for w, _ in parts)
-    mu = sum(w * v for w, v in parts) / wsum
-    median = clamp(inv_logit(mu))
-    median = min(median, TIER_MEDIAN_CAP.get(tier, 95.0))
-    median = clamp(median)
-
-    # --- Spread: fit residual + estimator disagreement + diffusion +
-    # refresh timing. ---
-    logits = [v for _, v in parts]
-    mean_l = sum(logits) / len(logits)
-    disagree = math.sqrt(sum((v - mean_l) ** 2 for v in logits) / len(logits))
-    sigma_fit = SIGMA_FIT_FLOOR
-    if resid_b is not None:
-        sigma_fit = min(SIGMA_FIT_CAP, max(SIGMA_FIT_FLOOR, resid_b))
-    sigma = math.sqrt(
-        sigma_fit ** 2
-        + disagree ** 2
-        + (SIGMA_RW_PER_SQRT_DAY * math.sqrt(horizon_days)) ** 2
-        + SIGMA_REFRESH ** 2
-    )
-    sigma = min(SIGMA_MAX, max(SIGMA_MIN, sigma))
-    return quantiles(median, sigma)
-
-
-def forecast_case(case):
-    """Forecast every trophy of one case. Returns {"trophies": [...]}."""
-    trophies = case["trophies"]
+def forecast_case(case, name):
+    levels = case.get("levels") or [0.05, 0.25, 0.5, 0.75, 0.95]
     history = case.get("history") or []
-    horizon_days = case["horizon_minutes"] / 1440.0
-    target = parse_time(case["target"])
-    t_target = (target - TIME_ORIGIN).total_seconds() / 3600.0
-    x_target = math.log(1.0 + max(0.0, (target - RELEASE).total_seconds() / 3600.0))
-
-    # Snapshot series with plateaus collapsed: (t, x, N, [rates]).
-    deduped = dedupe_history(history)
-    snaps_all = []
-    for h in deduped:
-        at = parse_time(h["at"])
-        t = (at - TIME_ORIGIN).total_seconds() / 3600.0
-        x = math.log(1.0 + max(0.0, (at - RELEASE).total_seconds() / 3600.0))
-        snaps_all.append((t, x, h.get("players_tracked"), h.get("rates") or []))
-
-    flat = len(snaps_all) <= 1
     checkpoint = parse_time(case["at"])
-    if flat and checkpoint < LAUNCH_WINDOW_END and snaps_all:
-        # Stale launch-night read: the next refresh dilutes every rate.
-        # Median cut + wide spread; the 100% trophy cannot fall.
-        rows = []
-        last_rates = snaps_all[-1][3]
-        for t in trophies:
-            tid = t["id"]
-            r = last_rates[tid - 1] if tid - 1 < len(last_rates) else None
-            if r is None:
-                rows.append({"id": tid,
-                             "q": quantiles(TIER_PRIOR_MEDIAN.get(t.get("tier", "bronze"), 5.0), 1.2)})
-            elif r >= 99.5:
-                rows.append({"id": tid, "q": quantiles(99.9, 0.15)})
-            else:
-                rows.append({"id": tid,
-                             "q": quantiles(clamp(r * FLAT_MEDIAN_FACTOR), FLAT_SIGMA)})
-        return {"trophies": rows}
-
-    # Population saturating fit: N(t) = B * (1 - exp(-t/tau_N)).
-    ts_n = [t for t, _, n, _ in snaps_all if n]
-    ys_n = [n for _, _, n, _ in snaps_all if n]
-    n_fit = sat_fit(ts_n, ys_n) if len(ts_n) >= 2 else None
-
-    # Per-trophy snapshot series.
-    per_trophy = {}
-    for t in trophies:
-        tid = t["id"]
-        snaps = []
-        for (tt, x, n, rates), h in zip(snaps_all, deduped):
-            r = rates[tid - 1] if tid - 1 < len(rates) else None
-            snaps.append((tt, x, n, r, parse_time(h["at"])))
-        per_trophy[tid] = snaps
-
+    target = parse_time(case["target"])
+    horizon_days = case.get("horizon_minutes", 0) / 1440.0
+    deduped = dedupe_reads(history)
     rows = []
-    for t in trophies:
-        try:
-            q = forecast_trophy(t, per_trophy[t["id"]], t_target, x_target,
-                                horizon_days, n_fit, checkpoint)
-        except Exception:
-            # Never lose a case to one bad trophy: fall back to its last
-            # rate with a wide spread.
-            last = None
-            for _, _, _, r, _ in reversed(per_trophy[t["id"]]):
-                if r is not None:
-                    last = r
-                    break
-            q = quantiles(clamp(last if last is not None else 1.0), 1.0)
-        rows.append({"id": t["id"], "q": q})
-    rows.sort(key=lambda row: row["id"])
+    for i, trophy in enumerate(case["trophies"]):
+        qs = forecast_trophy(i, trophy, deduped, checkpoint, target, horizon_days)
+        if len(qs) != len(levels):  # pragma: no cover - levels are fixed
+            raise ValueError(f"{name}: wrong quantile count")
+        rows.append({"id": trophy["id"], "q": qs})
     return {"trophies": rows}
 
 
-def safe_forecast_case(case):
-    """forecast_case, but a broken case still yields a valid-shaped output."""
-    try:
-        return forecast_case(case)
-    except Exception:
-        rows = []
-        last_rates = []
-        hist = case.get("history") or []
-        if hist:
-            last_rates = hist[-1].get("rates") or []
-        for t in case["trophies"]:
-            tid = t["id"]
-            r = last_rates[tid - 1] if tid - 1 < len(last_rates) else None
-            rows.append({"id": tid,
-                         "q": quantiles(clamp(r if r is not None else 1.0), 1.0)})
-        return {"trophies": rows}
-
-
 def main():
-    INPUT_DIR.mkdir(parents=True, exist_ok=True)
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    case_files = sorted(INPUT_DIR.glob("*.in"))
-    if not case_files:
-        raise SystemExit("no case files in input directory")
-    for path in case_files:
+    # Every case file, in name order, so two runs write the same bytes.
+    for path in sorted(INPUT_DIR.glob("*.in")):
         case = json.loads(path.read_text(encoding="utf-8"))
-        out = safe_forecast_case(case)
-        text = json.dumps(out, separators=(",", ":"))
-        if len(text.encode("utf-8")) > 65536:
-            raise SystemExit(f"{path.name}: output over 65,536 bytes")
-        (OUTPUT_DIR / (path.stem + ".out")).write_text(text, encoding="utf-8")
+        forecast = forecast_case(case, path.name)
+        (OUTPUT_DIR / f"{path.stem}.out").write_text(
+            json.dumps(forecast, separators=(",", ":")) + "\n", encoding="utf-8")
 
 
 if __name__ == "__main__":
